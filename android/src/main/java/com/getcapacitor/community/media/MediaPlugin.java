@@ -2,9 +2,13 @@ package com.getcapacitor.community.media;
 
 import android.Manifest;
 import android.app.DownloadManager;
+import android.content.ContentResolver;
+import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.database.Cursor;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -23,6 +27,8 @@ import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.CapacitorPlugin;
 import com.getcapacitor.annotation.Permission;
 import com.getcapacitor.annotation.PermissionCallback;
+
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
@@ -32,8 +38,10 @@ import java.io.OutputStream;
 import java.io.InputStream;
 import java.nio.channels.FileChannel;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -66,11 +74,203 @@ public class MediaPlugin extends Plugin {
     public static final String EC_DOWNLOAD_ERROR = "downloadError";
     public static final String EC_FS_ERROR = "filesystemError";
 
-    // @todo
     @PluginMethod
     public void getMedias(PluginCall call) {
-        call.unimplemented();
+        Log.d("MediaPlugin", "Running getMedias");
+
+        if (!isStoragePermissionGranted()) {
+            Log.d("MediaPlugin", "No permission, requesting...");
+            this.bridge.saveCall(call);
+            requestAllPermissions(call, "permissionCallback");
+            return;
+        }
+
+        _getMedias(call);
     }
+
+    private void _getMedias(PluginCall call) {
+        int quantity = call.getInt("quantity", 25);
+        int offset = call.getInt("offset", 0); // Add offset parameter
+        String types = call.getString("types", "photos"); // "photos", "videos", or "all"
+        int thumbnailWidth = call.getInt("thumbnailWidth", 256);
+        int thumbnailHeight = call.getInt("thumbnailHeight", 256);
+        int thumbnailQuality = call.getInt("thumbnailQuality", 80);
+
+        Log.d("MediaPlugin", "Params -> quantity: " + quantity + ", offset: " + offset + ", types: " + types);
+
+        JSArray result = new JSArray();
+        ContentResolver resolver = getContext().getContentResolver();
+
+        List<Uri> uris = new ArrayList<>();
+        if (types.equals("photos")) {
+            uris.add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+        } else if (types.equals("videos")) {
+            uris.add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI);
+        } else {
+            uris.add(MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+            uris.add(MediaStore.Video.Media.EXTERNAL_CONTENT_URI);
+        }
+
+        // Get total count first
+        int totalCount = 0;
+        for (Uri uri : uris) {
+            String[] projection = { MediaStore.MediaColumns._ID };
+
+            Cursor countCursor = resolver.query(
+                    uri,
+                    projection,
+                    null,
+                    null,
+                    null
+            );
+
+            if (countCursor != null) {
+                totalCount += countCursor.getCount();
+                countCursor.close();
+            }
+        }
+
+        // Calculate actual start and end indices
+        int startIndex = Math.min(offset, totalCount);
+        int endIndex = Math.min(startIndex + quantity, totalCount);
+
+        // Check if there is more data
+        boolean hasMore = endIndex < totalCount;
+
+        int collected = 0;
+        int skipped = 0;
+
+        for (Uri uri : uris) {
+            if (collected >= quantity) break;
+
+            String[] projection = {
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.DATE_ADDED,
+                    MediaStore.MediaColumns.DATA,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.WIDTH,
+                    MediaStore.MediaColumns.HEIGHT
+            };
+
+            Cursor cursor = resolver.query(
+                    uri,
+                    projection,
+                    null,
+                    null,
+                    MediaStore.MediaColumns.DATE_ADDED + " DESC"
+            );
+
+            if (cursor == null) {
+                Log.w("MediaPlugin", "Cursor null for URI: " + uri);
+                continue;
+            }
+
+            // Only process assets within the specified range
+            while (cursor.moveToNext() && collected < quantity) {
+                // Skip items until we reach the offset
+                if (skipped < offset) {
+                    skipped++;
+                    continue;
+                }
+
+                int idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID);
+                int dataColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATA);
+                int mimeColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE);
+                int dateColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DATE_ADDED);
+
+                long id = cursor.getLong(idColumn);
+                String path = cursor.getString(dataColumn);
+                String mimeType = cursor.getString(mimeColumn);
+                long created = cursor.getLong(dateColumn);
+
+                Bitmap thumbnail = null;
+                try {
+                    BitmapFactory.Options options = new BitmapFactory.Options();
+                    options.inJustDecodeBounds = false;
+                    options.inSampleSize = 2;
+
+                    if (mimeType != null && mimeType.startsWith("video")) {
+                        // For videos, use different thumbnail method
+                        thumbnail = MediaStore.Video.Thumbnails.getThumbnail(
+                                resolver,
+                                id,
+                                MediaStore.Video.Thumbnails.MINI_KIND,
+                                options
+                        );
+                    } else {
+                        // For images
+                        thumbnail = MediaStore.Images.Thumbnails.getThumbnail(
+                                resolver,
+                                id,
+                                MediaStore.Images.Thumbnails.MINI_KIND,
+                                options
+                        );
+                    }
+                } catch (Exception e) {
+                    Log.e("MediaPlugin", "Thumbnail failed for id=" + id, e);
+                }
+
+                String thumbnailBase64 = "";
+                if (thumbnail != null) {
+                    try {
+                        // Resize thumbnail to requested dimensions
+                        Bitmap resizedThumbnail = Bitmap.createScaledBitmap(
+                                thumbnail,
+                                thumbnailWidth,
+                                thumbnailHeight,
+                                true
+                        );
+
+                        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                        resizedThumbnail.compress(Bitmap.CompressFormat.JPEG, thumbnailQuality, outputStream);
+                        byte[] bytes = outputStream.toByteArray();
+                        thumbnailBase64 = Base64.encodeToString(bytes, Base64.NO_WRAP);
+
+                        // Clean up bitmaps
+                        if (resizedThumbnail != thumbnail) {
+                            resizedThumbnail.recycle();
+                        }
+                        thumbnail.recycle();
+                    } catch (Exception e) {
+                        Log.e("MediaPlugin", "Base64 encode error", e);
+                    }
+                } else {
+                    Log.w("MediaPlugin", "No thumbnail for item id=" + id);
+                }
+
+                JSObject media = new JSObject();
+                media.put("identifier", String.valueOf(id));
+                media.put("path", "file://" + path);
+                media.put("creationDate", new Date(created * 1000).toString());
+                media.put("type", mimeType != null && mimeType.startsWith("video") ? "video" : "photo");
+                media.put("data", thumbnailBase64);
+
+                // Add additional metadata for consistency with iOS
+                media.put("fullWidth", 0); // Android doesn't easily provide this without loading the full image
+                media.put("fullHeight", 0);
+                media.put("thumbnailWidth", thumbnailWidth);
+                media.put("thumbnailHeight", thumbnailHeight);
+                media.put("location", new JSObject()); // Empty location object
+
+                result.put(media);
+                collected++;
+            }
+
+            cursor.close();
+        }
+
+        JSObject response = new JSObject();
+        response.put("medias", result);
+        response.put("hasMore", hasMore);
+        response.put("totalCount", totalCount);
+        response.put("offset", offset);
+        response.put("quantity", quantity);
+        response.put("currentPageSize", collected);
+
+        Log.d("MediaPlugin", "getMedias finished with " + collected + " items, hasMore: " + hasMore + ", totalCount: " + totalCount);
+        call.resolve(response);
+    }
+
 
     @PluginMethod
     public void getMediaByIdentifier(PluginCall call) {
@@ -139,7 +339,7 @@ public class MediaPlugin extends Plugin {
         }
 
         switch (call.getMethodName()) {
-            case "getMedias" -> call.unimplemented();
+            case "getMedias" -> _getMedias(call);
             case "getAlbums" -> _getAlbums(call);
             case "savePhoto", "saveVideo" -> _saveMedia(call);
             case "createAlbum" -> _createAlbum(call);

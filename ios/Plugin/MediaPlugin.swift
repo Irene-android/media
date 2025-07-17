@@ -46,7 +46,7 @@ public class MediaPlugin: CAPPlugin {
 
     @objc func getMedias(_ call: CAPPluginCall) {
         checkAuthorization(permission: .readWrite, allowed: {
-            self.fetchResultAssetsToJs(call)
+            self.fetchResultAssetsToJsOffset(call)
         }, notAllowed: {
             call.reject("Access to photos not allowed by user", EC_ACCESS_DENIED)
         })
@@ -463,6 +463,143 @@ public class MediaPlugin: CAPPlugin {
             ])
     }
 
+    func fetchResultAssetsToJsOffset(_ call: CAPPluginCall) {
+        var assets: [JSObject] = []
+
+        let albumId = call.getString("albumIdentifier")
+        let quantity = call.getInt("quantity", MediaPlugin.DEFAULT_QUANTITY)
+        let offset = call.getInt("offset", 0) // Add offset parameter
+
+        var targetCollection: PHAssetCollection?
+
+        let options = PHFetchOptions()
+        // Remove fetchLimit, we need to get more data to support offset
+        
+        let types = call.getString("types") ?? MediaPlugin.DEFAULT_TYPES
+        if types == "photos" {
+            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+        } else if types == "videos" {
+            options.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+        } else if types == "all" {
+            options.predicate = NSPredicate(format: "(mediaType == %d) || (mediaType == %d)", argumentArray: [PHAssetMediaType.image.rawValue, PHAssetMediaType.video.rawValue])
+        }
+        
+        // Set sort descriptors
+        var sortDescriptors = [] as [NSSortDescriptor]
+        
+        // Handle when sort is string
+        if call.getString("sort") != nil {
+            let key = call.getString("sort") ?? "creationDate"
+            sortDescriptors.append(NSSortDescriptor(key: key, ascending: false))
+        }
+        // Handle when sort is an array
+        else if let sortArray = call.getArray("sort") as? [[String: Any]] {
+            for object in sortArray {
+                // Should have at least key for array value
+                if let key = object["key"] as? String {
+                    let ascending = object["ascending"] as? Bool ?? false
+                    sortDescriptors.append(NSSortDescriptor(key: key, ascending: ascending))
+                }
+            }
+        }
+        
+        // Check if sort descriptors are empty
+        // it can happen because of validations inside the previous if, in this case, set a default value
+        if sortDescriptors.isEmpty {
+            sortDescriptors.append(NSSortDescriptor(key: "creationDate", ascending: false))
+        }
+        
+        // Set sort descriptors
+        options.sortDescriptors = sortDescriptors
+
+        // Get target collection
+        if albumId != nil {
+            let albumFetchResult = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [albumId!], options: nil)
+            albumFetchResult.enumerateObjects({ (collection, count, _) in
+                targetCollection = collection
+            })
+        }
+
+        var fetchResult: PHFetchResult<PHAsset>
+        if targetCollection != nil {
+            fetchResult = PHAsset.fetchAssets(in: targetCollection!, options: options)
+        } else {
+            fetchResult = PHAsset.fetchAssets(with: options)
+        }
+
+        // Calculate actual start and end indices
+        let totalCount = fetchResult.count
+        let startIndex = min(offset, totalCount)
+        let endIndex = min(startIndex + quantity, totalCount)
+        
+        // Check if there is more data
+        let hasMore = endIndex < totalCount
+
+        let thumbnailWidth = call.getInt("thumbnailWidth", MediaPlugin.DEFAULT_THUMBNAIL_WIDTH)
+        let thumbnailHeight = call.getInt("thumbnailHeight", MediaPlugin.DEFAULT_THUMBNAIL_HEIGHT)
+        let thumbnailSize = CGSize(width: thumbnailWidth, height: thumbnailHeight)
+        let thumbnailQuality = call.getInt("thumbnailQuality", 95)
+        let requestOptions = PHImageRequestOptions()
+        requestOptions.isNetworkAccessAllowed = true
+        requestOptions.version = .current
+        requestOptions.deliveryMode = .opportunistic
+        requestOptions.isSynchronous = true
+
+        // Use DispatchGroup to handle asynchronous image requests
+        let dispatchGroup = DispatchGroup()
+        var processedAssets: [(Int, JSObject)] = [] // Store assets with index to maintain order
+
+        // Only process assets within the specified range
+        for i in startIndex..<endIndex {
+            let asset = fetchResult.object(at: i)
+            
+            dispatchGroup.enter()
+            
+            self.imageManager.requestImage(for: asset, targetSize: thumbnailSize, contentMode: .aspectFill, options: requestOptions, resultHandler: { (fetchedImage, _) in
+                defer {
+                    dispatchGroup.leave()
+                }
+                
+                guard let image = fetchedImage else {
+                    return
+                }
+
+                var a = JSObject()
+                a["identifier"] = asset.localIdentifier
+                a["data"] = image.jpegData(compressionQuality: CGFloat(thumbnailQuality) / 100.0)?.base64EncodedString()
+
+                if asset.creationDate != nil {
+                    a["creationDate"] = JSDate.toString(asset.creationDate!)
+                }
+                a["duration"] = asset.mediaType == .video ? asset.duration : nil
+                a["fullWidth"] = asset.pixelWidth
+                a["fullHeight"] = asset.pixelHeight
+                a["thumbnailWidth"] = image.size.width
+                a["thumbnailHeight"] = image.size.height
+                a["location"] = self.makeLocation(asset)
+                a["type"] = asset.mediaType == .image ? "photo" : "video"
+
+                // Store assets with index to maintain order
+                processedAssets.append((i - startIndex, a))
+            })
+        }
+
+        // Wait for all image requests to complete
+        dispatchGroup.notify(queue: .main) {
+            // Sort by index to maintain correct order
+            processedAssets.sort { $0.0 < $1.0 }
+            assets = processedAssets.map { $0.1 }
+            
+            call.resolve([
+                "medias": assets,
+                "hasMore": hasMore,
+                "totalCount": totalCount,
+                "offset": offset,
+                "quantity": quantity,
+                "currentPageSize": assets.count
+            ])
+        }
+    }
 
     func makeLocation(_ asset: PHAsset) -> JSObject {
         var loc = JSObject()
