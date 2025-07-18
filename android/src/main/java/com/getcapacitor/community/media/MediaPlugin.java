@@ -213,13 +213,7 @@ public class MediaPlugin extends Plugin {
                 String thumbnailBase64 = "";
                 if (thumbnail != null) {
                     try {
-                        // Resize thumbnail to requested dimensions
-                        Bitmap resizedThumbnail = Bitmap.createScaledBitmap(
-                                thumbnail,
-                                thumbnailWidth,
-                                thumbnailHeight,
-                                true
-                        );
+                        Bitmap resizedThumbnail = centerCrop(thumbnail, thumbnailWidth, thumbnailHeight);
 
                         ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
                         resizedThumbnail.compress(Bitmap.CompressFormat.JPEG, thumbnailQuality, outputStream);
@@ -271,6 +265,32 @@ public class MediaPlugin extends Plugin {
         call.resolve(response);
     }
 
+        private Bitmap centerCrop(Bitmap srcBmp, int targetWidth, int targetHeight) {
+        if (srcBmp == null) return null;
+        float srcWidth = srcBmp.getWidth();
+        float srcHeight = srcBmp.getHeight();
+
+        float scale;
+        float dx = 0, dy = 0;
+
+        if (srcWidth * targetHeight > targetWidth * srcHeight) {
+            scale = targetHeight / srcHeight;
+            dx = (targetWidth - srcWidth * scale) * 0.5f;
+        } else {
+            scale = targetWidth / srcWidth;
+            dy = (targetHeight - srcHeight * scale) * 0.5f;
+        }
+
+        android.graphics.Matrix matrix = new android.graphics.Matrix();
+        matrix.setScale(scale, scale);
+        matrix.postTranslate(dx, dy);
+
+        Bitmap result = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888);
+        android.graphics.Canvas canvas = new android.graphics.Canvas(result);
+        canvas.drawBitmap(srcBmp, matrix, null);
+
+        return result;
+    }
 
     @PluginMethod
     public void getMediaByIdentifier(PluginCall call) {
